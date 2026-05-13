@@ -162,17 +162,35 @@ func findDefinitionFile(urls []string, client http.Client) (bool, *openapi3.T) {
 		} else if strings.Contains(ct, "application/javascript") {
 			bodyBytes, bodyString, _ := MakeRequest(client, "GET", url, timeout, nil)
 			if bodyBytes != nil {
-				regexPattern := regexp.MustCompile(`(?s)let\s+(\w+)\s*=\s*({.*?});`)
+				regexPattern := regexp.MustCompile(`(?s)(?:let|const|var)\s+(\w+)\s*=\s*({.*?});`)
 				matches := regexPattern.FindAllStringSubmatch(bodyString, -1)
 				for _, match := range matches {
 					if len(match) < 3 {
 						continue
 					}
-					jsonContent := match[2]
-					checkSpec := UnmarshalSpec([]byte(jsonContent))
+					jsonContent := []byte(match[2])
+					checkSpec := UnmarshalSpec(jsonContent)
 					if strings.HasPrefix(checkSpec.OpenAPI, "2") || strings.HasPrefix(checkSpec.OpenAPI, "3") {
 						printInfo("\nFound operation definitions embedded in JavaScript file at %s\n", url)
 						return true, checkSpec
+					}
+					// Swagger UI commonly nests the spec one level deep under
+					// keys like swaggerDoc (swagger-ui-express / NestJS),
+					// spec (Swagger UI Bundle config), or openapi.
+					var wrapper map[string]json.RawMessage
+					if err := json.Unmarshal(jsonContent, &wrapper); err != nil {
+						continue
+					}
+					for _, key := range []string{"swaggerDoc", "spec", "openapi"} {
+						inner, ok := wrapper[key]
+						if !ok {
+							continue
+						}
+						checkSpec := UnmarshalSpec(inner)
+						if strings.HasPrefix(checkSpec.OpenAPI, "2") || strings.HasPrefix(checkSpec.OpenAPI, "3") {
+							printInfo("\nFound operation definitions embedded in JavaScript file at %s\n", url)
+							return true, checkSpec
+						}
 					}
 				}
 			}
