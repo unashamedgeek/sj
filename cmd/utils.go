@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"os"
@@ -49,6 +50,19 @@ func BuildRequestsFromPaths(spec map[string]interface{}, client http.Client, rep
 	}
 	slices.Sort(pathKeys)
 
+	// Snapshot CLI-supplied headers so per-endpoint Content-Type
+	// mutations from EnforceSingleContentType don't leak across endpoints.
+	userHeaders := append([]string(nil), Headers...)
+	var userContentType string
+	for _, h := range userHeaders {
+		if strings.HasPrefix(strings.ToLower(h), "content-type:") {
+			if idx := strings.Index(h, ":"); idx >= 0 {
+				userContentType = strings.TrimSpace(h[idx+1:])
+			}
+			break
+		}
+	}
+
 	var errorDescriptions = make(map[any]string)
 	for _, pathName := range pathKeys {
 		pathItem := paths[pathName]
@@ -68,6 +82,11 @@ func BuildRequestsFromPaths(spec map[string]interface{}, client http.Client, rep
 					continue
 				default:
 					if opMap, ok := op.(map[string]interface{}); ok {
+						// Reset header state so the previous endpoint's
+						// Content-Type doesn't leak into this one.
+						Headers = append([]string(nil), userHeaders...)
+						contentType = userContentType
+
 						if responses, ok := opMap["responses"].(map[string]interface{}); ok {
 							for status, respItem := range responses {
 								if respMap, ok := respItem.(map[string]interface{}); ok {
@@ -225,23 +244,42 @@ func BuildRequestsFromPaths(spec map[string]interface{}, client http.Client, rep
 											if cType == "application/json" {
 												bodyBytes, err := json.Marshal(example)
 												if err == nil {
+													bodyData = string(bodyBytes)
 													curl += fmt.Sprintf(" -H \"Content-Type: application/json\" -d '%s'", bodyBytes)
 												}
 											}
 											if cType == "application/xml" || cType == "text/xml" {
 												if obj, ok := example.(map[string]interface{}); ok {
 													xml := XmlFromObject(obj)
+													bodyData = xml
 													curl += fmt.Sprintf(" -H \"Content-Type: %s\" -d '%s'", cType, xml)
 												}
 											}
-											if cType == "application/x-www-form-urlencoded" || cType == "multipart/form-data" {
+											if cType == "application/x-www-form-urlencoded" {
 												if obj, ok := example.(map[string]interface{}); ok {
 													var formParts []string
 													for k, v := range obj {
 														formParts = append(formParts, fmt.Sprintf("%s=%v", k, v))
 													}
-													formData := strings.Join(formParts, "&")
-													curl += fmt.Sprintf(" -H \"Content-Type: %s\" -d '%s'", cType, formData)
+													bodyData = strings.Join(formParts, "&")
+													curl += fmt.Sprintf(" -H \"Content-Type: %s\" -d '%s'", cType, bodyData)
+												}
+											}
+											if cType == "multipart/form-data" {
+												if obj, ok := example.(map[string]interface{}); ok {
+													var buf bytes.Buffer
+													mw := multipart.NewWriter(&buf)
+													for k, v := range obj {
+														_ = mw.WriteField(k, fmt.Sprintf("%v", v))
+													}
+													_ = mw.Close()
+													bodyData = buf.String()
+													// Replace the bare multipart/form-data Content-Type
+													// (set earlier in the loop) with a boundary-aware one.
+													EnforceSingleContentType(mw.FormDataContentType())
+													for k, v := range obj {
+														curl += fmt.Sprintf(" -F \"%s=%v\"", k, v)
+													}
 												}
 											}
 										}
@@ -265,9 +303,8 @@ func BuildRequestsFromPaths(spec map[string]interface{}, client http.Client, rep
 						switch os.Args[1] {
 						case "automate":
 							var postBodyData string
-							if strings.ToLower(method) == "post" && strings.Contains(curl, "-d") {
-								dataIndex := strings.Index(curl, "'")
-								postBodyData = curl[dataIndex+1 : len(curl)-1]
+							if strings.ToLower(method) == "post" {
+								postBodyData = bodyData
 							}
 
 							_, resp, sc := MakeRequest(client, strings.ToUpper(method), targetURL, timeout, bytes.NewReader([]byte(postBodyData)))
@@ -540,6 +577,15 @@ func GenerateExample(node *SchemaNode) interface{} {
 }
 
 func GenerateRequests(bodyBytes []byte, client http.Client, replayClient *http.Client) {
+	// Swagger UI bundles serve the spec wrapped in JavaScript (e.g.
+	// swagger-ui-init.js). Detect that and unwrap before parsing so the
+	// downstream YAML/JSON unmarshal succeeds.
+	if looksLikeJSSpec(bodyBytes) {
+		if extracted, ok := ExtractJSONFromJSSpec(bodyBytes); ok {
+			bodyBytes = extracted
+		}
+	}
+
 	// Ingests the specification file
 	spec := SafelyUnmarshalSpec(bodyBytes)
 
@@ -805,6 +851,30 @@ func SetScheme(swaggerURL string) (scheme string) {
 		scheme = "https"
 	}
 	return scheme
+}
+
+// looksLikeJSSpec is a cheap content sniff so we only run the JS-extraction
+// regex against bodies that plausibly contain JavaScript. Normal JSON
+// (starts with `{`/`[`) and YAML (starts with `openapi:`/`swagger:`/`---`/`#`)
+// fall through unchanged.
+func looksLikeJSSpec(b []byte) bool {
+	if strings.HasSuffix(strings.ToLower(swaggerURL), ".js") ||
+		strings.HasSuffix(strings.ToLower(localFile), ".js") ||
+		strings.ToLower(format) == "js" {
+		return true
+	}
+	trimmed := bytes.TrimLeft(b, " \t\r\n")
+	prefixes := [][]byte{
+		[]byte("var "), []byte("let "), []byte("const "),
+		[]byte("(function"), []byte("window."),
+		[]byte("//"), []byte("/*"),
+	}
+	for _, p := range prefixes {
+		if bytes.HasPrefix(trimmed, p) {
+			return true
+		}
+	}
+	return false
 }
 
 func SafelyUnmarshalSpec(data []byte) map[string]interface{} {

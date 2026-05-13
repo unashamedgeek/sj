@@ -160,37 +160,13 @@ func findDefinitionFile(urls []string, client http.Client) (bool, *openapi3.T) {
 				}
 			}
 		} else if strings.Contains(ct, "application/javascript") {
-			bodyBytes, bodyString, _ := MakeRequest(client, "GET", url, timeout, nil)
+			bodyBytes, _, _ := MakeRequest(client, "GET", url, timeout, nil)
 			if bodyBytes != nil {
-				regexPattern := regexp.MustCompile(`(?s)(?:let|const|var)\s+(\w+)\s*=\s*({.*?});`)
-				matches := regexPattern.FindAllStringSubmatch(bodyString, -1)
-				for _, match := range matches {
-					if len(match) < 3 {
-						continue
-					}
-					jsonContent := []byte(match[2])
+				if jsonContent, ok := ExtractJSONFromJSSpec(bodyBytes); ok {
 					checkSpec := UnmarshalSpec(jsonContent)
 					if strings.HasPrefix(checkSpec.OpenAPI, "2") || strings.HasPrefix(checkSpec.OpenAPI, "3") {
 						printInfo("\nFound operation definitions embedded in JavaScript file at %s\n", url)
 						return true, checkSpec
-					}
-					// Swagger UI commonly nests the spec one level deep under
-					// keys like swaggerDoc (swagger-ui-express / NestJS),
-					// spec (Swagger UI Bundle config), or openapi.
-					var wrapper map[string]json.RawMessage
-					if err := json.Unmarshal(jsonContent, &wrapper); err != nil {
-						continue
-					}
-					for _, key := range []string{"swaggerDoc", "spec", "openapi"} {
-						inner, ok := wrapper[key]
-						if !ok {
-							continue
-						}
-						checkSpec := UnmarshalSpec(inner)
-						if strings.HasPrefix(checkSpec.OpenAPI, "2") || strings.HasPrefix(checkSpec.OpenAPI, "3") {
-							printInfo("\nFound operation definitions embedded in JavaScript file at %s\n", url)
-							return true, checkSpec
-						}
 					}
 				}
 			}
@@ -208,6 +184,49 @@ func init() {
 	// TODO: Add a flag here (boolean) that defaults to false that will cause the program to execute 'sj automate' on the discovered definition file automatically.
 	bruteCmd.PersistentFlags().StringVarP(&endpointWordlist, "wordlist", "w", "", "The file containing a list of paths to brute force for discovery.")
 	bruteCmd.Flags().BoolVarP(&endpointOnly, "endpoint-only", "e", false, "Only return the identified endpoint")
+}
+
+// ExtractJSONFromJSSpec scans a Swagger-UI-style JavaScript bundle for an
+// OpenAPI/Swagger document assigned to a top-level var/let/const. If the
+// captured value is itself a wrapper object (swagger-ui-express / swagger-ui
+// bundle config), it unwraps one level via the swaggerDoc/spec/openapi keys.
+// Returns the extracted JSON bytes and true on success, or the original
+// bytes and false on failure.
+func ExtractJSONFromJSSpec(bodyBytes []byte) ([]byte, bool) {
+	re := regexp.MustCompile(`(?s)(?:let|const|var)\s+(\w+)\s*=\s*({.*?});`)
+	matches := re.FindAllStringSubmatch(string(bodyBytes), -1)
+	for _, m := range matches {
+		if len(m) < 3 {
+			continue
+		}
+		candidate := []byte(m[2])
+		if looksLikeAPISpec(candidate) {
+			return candidate, true
+		}
+		var wrapper map[string]json.RawMessage
+		if err := json.Unmarshal(candidate, &wrapper); err != nil {
+			continue
+		}
+		for _, key := range []string{"swaggerDoc", "spec", "openapi"} {
+			if inner, ok := wrapper[key]; ok && looksLikeAPISpec(inner) {
+				return inner, true
+			}
+		}
+	}
+	return bodyBytes, false
+}
+
+func looksLikeAPISpec(b []byte) bool {
+	var probe struct {
+		OpenAPI string `json:"openapi"`
+		Swagger string `json:"swagger"`
+	}
+	if err := json.Unmarshal(b, &probe); err != nil {
+		return false
+	}
+	return strings.HasPrefix(probe.OpenAPI, "3") ||
+		strings.HasPrefix(probe.OpenAPI, "2") ||
+		strings.HasPrefix(probe.Swagger, "2")
 }
 
 func ExtractSpecFromJS(bodyBytes []byte) []byte {
